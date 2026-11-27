@@ -368,6 +368,36 @@ def test_an_unreachable_store_degrades_to_worker_local(loop):
     assert b.snapshot() == []                # and not an exception
 
 
+def test_degraded_facade_is_not_called_at_all(loop):
+    """While ``ctx.state.degraded`` is set, a poll must not pay the bridge wait
+    (the facade still issues ops during an outage; it only records the
+    breaker): no kv call is made and the read returns at once."""
+    calls: list[str] = []
+
+    class _SlowKv:
+        async def get(self, name):
+            calls.append(name)
+            await asyncio.sleep(0.5)
+
+        scan = put = delete = get
+
+    ctx = _FakeCtx(_SlowKv())
+    ctx.state.degraded = True
+    a = _load_worker("jobs_worker_a_degraded")
+    a.bind(ctx, loop)
+
+    t0 = time.monotonic()
+    assert a.get("run-nope") is None
+    assert a.snapshot() == []
+    assert time.monotonic() - t0 < 1.0, "a degraded facade must short-circuit"
+    assert calls == []
+
+    ctx.state.degraded = False   # recovery: sharing resumes
+    a._BRIDGE_TIMEOUT_S = 0.2
+    a.get("run-nope")
+    assert calls == ["run-nope"]
+
+
 def test_sharing_can_be_turned_off(monkeypatch, loop):
     """`AW_ARCHITECTURE_JOBS_SHARED=0` is the field escape hatch."""
     a = _load_worker("jobs_worker_a_off")

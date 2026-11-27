@@ -135,6 +135,11 @@ def _call(coro_fn: Any, *args: Any) -> Any:
     ``start()`` mirror write takes that path."""
     if not _sharing_enabled() or _ctx is None or _loop is None:
         return None
+    # The facade records an outage on its breaker but still issues the op, so
+    # during one every poll would pay the full bridge wait. Honour its public
+    # degraded signal and stay worker-local until it clears.
+    if getattr(_ctx.state, "degraded", False):
+        return None
     try:
         coro = coro_fn(*args)
         try:
