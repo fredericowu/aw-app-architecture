@@ -20,7 +20,7 @@ that an instance-based test cannot reach.
 Both copies share one store, and the suite runs twice over:
 
 * **fake** — an in-memory stand-in for the sync redis client, injected by
-  monkeypatching `_store`. No service needed, so this arm runs everywhere,
+  injecting a fake `ctx.state.kv` via `bind`. No service needed, so this arm runs everywhere,
   including this repo's own CI (which has neither a Redis nor an aw-workspace
   checkout). It exercises the real code path: both module copies go through
   `_mirror`/`_read_shared`/`_scan_shared`.
@@ -34,6 +34,7 @@ test_snapshot_spans_workers fail on both arms.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -42,6 +43,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -49,7 +51,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _JOBS_PY = _REPO_ROOT / "architecture_app" / "jobs.py"
 
 # Isolate this run's keys from any real workspace sharing the same Redis. Set
-# before anything reads it, since _key_prefix() resolves it per call.
+# before anything reads it (the facade's key prefix resolves it per call).
 os.environ["AW_WORKSPACE"] = f"architecture-jobs-test-{uuid.uuid4().hex[:8]}"
 os.environ.pop("AW_ARCHITECTURE_JOBS_SHARED", None)
 
@@ -66,95 +68,114 @@ def _load_worker(name: str):
 
 # ---- the two store backends -------------------------------------------------
 
-class _FakeSyncRedis:
-    """Enough of redis-py's sync surface for jobs.py: set(ex=), get, scan_iter.
-
-    TTLs are honoured against a monotonic clock so the expiry behaviour the
-    module relies on is actually exercised, not just accepted.
-    """
+class _FakeKv:
+    """Async stand-in for ``ctx.state.kv`` — put(ttl required)/get/scan, TTLs
+    honoured against the wall clock so expiry behaviour is really exercised."""
 
     def __init__(self) -> None:
-        self.data: dict[str, tuple[str, float | None]] = {}
+        self.data: dict[str, tuple[Any, float]] = {}
 
-    def set(self, key, value, ex=None):
-        self.data[key] = (value, (time.time() + ex) if ex else None)
-        return True
+    async def put(self, name, value, ttl):
+        self.data[name] = (json.loads(json.dumps(value)), time.time() + ttl)
 
-    def get(self, key):
-        entry = self.data.get(key)
-        if entry is None:
+    async def get(self, name):
+        entry = self.data.get(name)
+        if entry is None or time.time() >= entry[1]:
+            self.data.pop(name, None)
             return None
-        value, expires = entry
-        if expires is not None and time.time() >= expires:
-            self.data.pop(key, None)
-            return None
-        return value
+        return entry[0]
 
-    def scan_iter(self, match=None):
-        prefix = (match or "*").rstrip("*")
-        for key in list(self.data):
-            if key.startswith(prefix) and self.get(key) is not None:
-                yield key
+    async def scan(self, prefix=""):
+        return [k for k in list(self.data)
+                if k.startswith(prefix) and await self.get(k) is not None]
+
+    async def delete(self, name):
+        self.data.pop(name, None)
 
 
-class _DeadRedis:
-    """A store that is reachable-looking but fails every call — the
-    "Redis is down" arm, which must degrade, not raise."""
+class _FakeCtx:
+    def __init__(self, kv) -> None:
+        self.state = type("State", (), {"kv": kv})()
 
-    def set(self, *a, **k):
+
+class _DeadKv:
+    """A store whose every call raises — must degrade, not escape."""
+
+    async def put(self, *a, **k):
         raise ConnectionError("store is down")
 
-    def get(self, *a, **k):
-        raise ConnectionError("store is down")
+    get = scan = delete = put
 
-    def scan_iter(self, *a, **k):
-        raise ConnectionError("store is down")
+
+@pytest.fixture(scope="module")
+def loop():
+    """One event loop on its own thread — stands in for the workspace loop the
+    app is activated on; run threads bridge onto it like they do in prod."""
+    lp = asyncio.new_event_loop()
+    t = threading.Thread(target=lp.run_forever, daemon=True)
+    t.start()
+    yield lp
+    lp.call_soon_threadsafe(lp.stop)
+    t.join(5)
 
 
 def _real_redis_url() -> str:
-    for var in ("AW_TEST_REDIS_URL", "AW_WORKSPACE_REDIS_URL", "AW_REDIS_URL"):
-        url = os.environ.get(var)
-        if url:
-            return url
-    return "redis://127.0.0.1:6379/0"
+    return next((os.environ[v] for v in ("AW_TEST_REDIS_URL", "AW_WORKSPACE_REDIS_URL",
+                                         "AW_REDIS_URL") if os.environ.get(v)),
+                "redis://127.0.0.1:6379/0")
 
 
-def _real_redis():
-    """A live sync client, or None — same resolution order jobs.py uses."""
+def _real_ctx():
+    """A real minimal ``AppContext`` granted ``state:own`` against a live
+    Redis, or None when core's ``src`` or a Redis is unavailable (this repo's
+    own CI has neither)."""
     try:
         import redis
 
-        client = redis.Redis.from_url(
-            _real_redis_url(), decode_responses=True,
-            socket_connect_timeout=2, socket_timeout=2)
-        client.ping()
-        return client
+        sys.path.insert(0, os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace"))
+        from src.apps.base import AppContext
+
+        url = next((os.environ[v] for v in ("AW_TEST_REDIS_URL", "AW_WORKSPACE_REDIS_URL",
+                                            "AW_REDIS_URL") if os.environ.get(v)),
+                   "redis://127.0.0.1:6379/0")
+        redis.Redis.from_url(url, socket_connect_timeout=2).ping()
+
+        class _Journal:
+            def record(self, *a, **kw):
+                pass
+
+        class _Runtime:
+            journal = _Journal()
+
+        return AppContext(runtime=_Runtime(), app_id="architecture", version="1.0.0",
+                          granted_permissions=["state:own"], config={},
+                          package_dir="/tmp/architecture")
     except Exception:
         return None
 
 
 @pytest.fixture(params=["fake", "real"])
-def workers(request, monkeypatch):
+def workers(request, loop):
     """Two independent copies of `jobs.py` sharing one store — worker A and
-    worker B. Yields `(a, b, client)`."""
+    worker B. Yields `(a, b, kv)`; `kv` is the fake store or the real facade."""
     if request.param == "real":
-        client = _real_redis()
-        if client is None:
-            pytest.skip("no reachable Redis for the real-store arm")
+        ctx = _real_ctx()
+        if ctx is None:
+            pytest.skip("no aw-workspace checkout + reachable Redis for the real arm")
     else:
-        client = _FakeSyncRedis()
-
+        ctx = _FakeCtx(_FakeKv())
     a = _load_worker(f"jobs_worker_a_{request.param}")
     b = _load_worker(f"jobs_worker_b_{request.param}")
     for worker in (a, b):
-        monkeypatch.setattr(worker, "_store", lambda _c=client: _c)
+        worker.bind(ctx, loop)
 
-    yield a, b, client
+    yield a, b, ctx.state.kv
 
     if request.param == "real":
-        prefix = a._key_prefix()
-        for key in client.scan_iter(match=f"{prefix}*"):
-            client.delete(key)
+        async def _cleanup():
+            for name in await ctx.state.kv.scan("run-"):
+                await ctx.state.kv.delete(name)
+        asyncio.run_coroutine_threadsafe(_cleanup(), loop).result(10)
 
 
 def _wait_for(predicate, timeout: float = 5.0, interval: float = 0.02):
@@ -182,6 +203,20 @@ def test_job_started_on_one_worker_is_visible_from_another(workers):
         "the 404 'no such run job' the CLI reads as a provisioning failure")
     assert seen["id"] == job["id"]
     assert seen["file_path"] == "/some/test_file.py"
+
+
+def test_start_on_the_loop_thread_does_not_deadlock_and_still_mirrors(workers, loop):
+    """`start()` is called from an async route, i.e. ON the bound loop, where
+    a blocking bridge would deadlock. It must schedule the mirror write
+    instead, and the job must still become visible to another worker."""
+    a, b, _ = workers
+
+    async def _from_route():
+        return a.start("/some/test_loop.py", lambda fp: {"ok": True})
+
+    job = asyncio.run_coroutine_threadsafe(_from_route(), loop).result(5)
+    assert _wait_for(lambda: b.get(job["id"])), (
+        "a job started on the loop thread never reached the shared store")
 
 
 def test_a_still_queued_job_is_visible_from_another_worker(workers):
@@ -288,8 +323,9 @@ def test_own_job_is_served_from_the_local_dict(workers):
     _wait_for(lambda: (a.get(job["id"]) or {}).get("status") == "done")
 
     # Corrupt the shared copy; the owner must be unaffected.
-    client.set(a._key_prefix() + job["id"], json.dumps({"id": job["id"],
-                                                        "status": "bogus"}), ex=60)
+    asyncio.run_coroutine_threadsafe(
+        client.put(job["id"], {"id": job["id"], "status": "bogus"}, 60),
+        a._loop).result(5)
     assert a.get(job["id"])["status"] == "done"
 
 
@@ -300,10 +336,13 @@ def test_finished_jobs_are_shared_with_the_retention_window_as_a_ttl(workers):
     job = a.start("/some/test_file.py", lambda fp: {"ok": True})
     _wait_for(lambda: (a.get(job["id"]) or {}).get("status") == "done")
 
-    ttl = client.ttl(a._key_prefix() + job["id"]) if hasattr(client, "ttl") else None
-    if ttl is None:  # fake client — assert against its own expiry bookkeeping
-        _value, expires = client.data[a._key_prefix() + job["id"]]
-        ttl = expires - time.time()
+    if hasattr(client, "data"):   # fake store — its own expiry bookkeeping
+        ttl = client.data[job["id"]][1] - time.time()
+    else:                         # real facade has no TTL read; probe the raw key
+        import redis as _redis
+        from src.apps.state_facade import kv_key
+        raw = _redis.Redis.from_url(_real_redis_url())
+        ttl = raw.ttl(kv_key("architecture", job["id"]))
     assert 0 < ttl <= a._RETAIN_SECONDS
     assert ttl > a._LIVE_TTL_S, (
         "a finished job must be retained for the full window, not the short "
@@ -312,14 +351,14 @@ def test_finished_jobs_are_shared_with_the_retention_window_as_a_ttl(workers):
 
 # ---- degradation -----------------------------------------------------------
 
-def test_an_unreachable_store_degrades_to_worker_local(monkeypatch):
+def test_an_unreachable_store_degrades_to_worker_local(loop):
     """Redis down must cost cross-worker visibility and nothing else: the job
     still runs, the owning worker still answers for it, no exception escapes."""
-    dead = _DeadRedis()
+    ctx = _FakeCtx(_DeadKv())
     a = _load_worker("jobs_worker_a_dead")
     b = _load_worker("jobs_worker_b_dead")
     for worker in (a, b):
-        monkeypatch.setattr(worker, "_store", lambda _c=dead: _c)
+        worker.bind(ctx, loop)
 
     job = a.start("/some/test_file.py", lambda fp: {"ok": True})
     done = _wait_for(lambda: (a.get(job["id"]) or {}).get("status") == "done"
@@ -329,19 +368,41 @@ def test_an_unreachable_store_degrades_to_worker_local(monkeypatch):
     assert b.snapshot() == []                # and not an exception
 
 
-def test_sharing_can_be_turned_off(monkeypatch):
+def test_degraded_facade_is_not_called_at_all(loop):
+    """While ``ctx.state.degraded`` is set, a poll must not pay the bridge wait
+    (the facade still issues ops during an outage; it only records the
+    breaker): no kv call is made and the read returns at once."""
+    calls: list[str] = []
+
+    class _SlowKv:
+        async def get(self, name):
+            calls.append(name)
+            await asyncio.sleep(0.5)
+
+        scan = put = delete = get
+
+    ctx = _FakeCtx(_SlowKv())
+    ctx.state.degraded = True
+    a = _load_worker("jobs_worker_a_degraded")
+    a.bind(ctx, loop)
+
+    t0 = time.monotonic()
+    assert a.get("run-nope") is None
+    assert a.snapshot() == []
+    assert time.monotonic() - t0 < 1.0, "a degraded facade must short-circuit"
+    assert calls == []
+
+    ctx.state.degraded = False   # recovery: sharing resumes
+    a._BRIDGE_TIMEOUT_S = 0.2
+    a.get("run-nope")
+    assert calls == ["run-nope"]
+
+
+def test_sharing_can_be_turned_off(monkeypatch, loop):
     """`AW_ARCHITECTURE_JOBS_SHARED=0` is the field escape hatch."""
     a = _load_worker("jobs_worker_a_off")
     monkeypatch.setenv(a.SHARE_ENV, "0")
-    assert a._store() is None
+    a.bind(_FakeCtx(_FakeKv()), loop)
+    assert a._call(lambda: a._ctx.state.kv.scan("")) is None
     monkeypatch.setenv(a.SHARE_ENV, "1")
     assert a._sharing_enabled() is True
-
-
-def test_key_prefix_is_scoped_to_the_workspace(monkeypatch):
-    """Two workspaces on one Redis must not see each other's jobs."""
-    a = _load_worker("jobs_worker_a_prefix")
-    monkeypatch.delenv("AW_WORKSPACE_REDIS_URL", raising=False)
-    prefix = a._key_prefix()
-    assert prefix.endswith("architecture:job:")
-    assert os.environ["AW_WORKSPACE"] in prefix
