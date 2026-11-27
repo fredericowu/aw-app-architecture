@@ -24,6 +24,7 @@
     "db:own-tables",
     "fs:workspace-read",
     "routes:register",
+    "state:own",
     "tasks:contribute",
     "ui:code",
     "ui:slots:core.nav.workspace"

@@ -41,7 +41,7 @@ exited non-zero with every component provisioned correctly, which the hourly
 3eb5bf3b-9510-810a-a513-ec5628c2656f.
 
 So each job is *also* written to a TTL'd Redis key
-(`aw:ws:<ws>:architecture:job:<id>`), which every worker can read — the same
+(`aw:ws:<ws>:app:architecture:kv:<id>` (via `ctx.state.kv`)), which every worker can read — the same
 STATE-mirror shape `src/apps/install_jobs.py` and `aw-app-devctl`'s tab
 registry already use for this exact class of bug, and the same in-process-dict
 → Redis move that fixed the cross-worker Telegram approval buttons in
@@ -65,6 +65,7 @@ request. `AW_ARCHITECTURE_JOBS_SHARED=0` turns the mirror off outright.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -99,18 +100,24 @@ _HEARTBEAT_INTERVAL_S = 30
 #: off without a redeploy.
 SHARE_ENV = "AW_ARCHITECTURE_JOBS_SHARED"
 
-#: After a failed Redis call, don't try again for this long. A store that is
-#: down has to cost one attempt per cooldown, not one attempt per poll —
-#: otherwise "Redis is unreachable" turns into "every job poll waits for a
-#: socket timeout first", which is a worse outcome than the bug this fixes.
-_BREAKER_COOLDOWN_S = 30
-
 _jobs: dict[str, dict[str, Any]] = {}
 _lock = threading.Lock()
 
-_client: Any = None
-_client_lock = threading.Lock()
-_breaker_until = 0.0
+#: ``ctx.state.kv`` is async and the registry here is sync (run threads), so
+#: calls are bridged onto the event loop that activated the app. Bounded so a
+#: wedged loop costs one timeout, never a hung poll.
+_ctx: Any = None
+_loop: asyncio.AbstractEventLoop | None = None
+_BRIDGE_TIMEOUT_S = 3.0
+
+
+def bind(ctx: Any, loop: asyncio.AbstractEventLoop | None = None) -> None:
+    """Hand the registry its ``ctx`` (``state:own``) and the loop to run
+    ``ctx.state.kv`` on. Called from ``plugin.activate``; until then (and in
+    standalone use) the registry is purely worker-local."""
+    global _ctx, _loop
+    _ctx = ctx
+    _loop = loop or asyncio.get_running_loop()
 
 
 # ---- the shared copy --------------------------------------------------------
@@ -120,122 +127,54 @@ def _sharing_enabled() -> bool:
         "0", "false", "no", "off")
 
 
-def _redis_url() -> str:
-    """Core's resolution order when core is importable, mirrored when it isn't.
-
-    Tier-1 apps run inside the workspace process, so `src.libs.redis_coord` is
-    normally right there — but this module also has to work in standalone mode
-    and in this repo's own CI, where there is no aw-workspace checkout on
-    `sys.path`. Falling back to the same three env vars keeps one behaviour
-    instead of two.
-    """
-    try:
-        from src.libs.redis_coord import get_workspace_redis_url
-        return get_workspace_redis_url()
-    except Exception:
-        return (os.environ.get("AW_WORKSPACE_REDIS_URL")
-                or os.environ.get("AW_REDIS_URL")
-                or "redis://127.0.0.1:6379/0")
-
-
-def _key_prefix() -> str:
-    """`aw:ws:<workspace>:architecture:job:` — scoped under the same
-    per-workspace namespace every other key in this Redis lives under, so two
-    workspaces sharing one instance cannot see each other's jobs."""
-    try:
-        from src.libs.redis_coord import _key_prefix as _core_prefix
-        base = _core_prefix()
-    except Exception:
-        base = f"aw:ws:{os.environ.get('AW_WORKSPACE') or 'default'}:"
-    return f"{base}architecture:job:"
-
-
-def _store() -> Any:
-    """The shared registry client, or ``None`` when sharing is off or the
-    store is in its failure cooldown.
-
-    Sync rather than async: every caller in this module is sync (the run
-    happens in a plain thread), same choice agents-platform-runners' warm pool
-    made for the same reason. The routes that read it go through
-    ``run_in_threadpool``.
-    """
-    global _client, _breaker_until
-    if not _sharing_enabled():
+def _call(coro_fn: Any, *args: Any) -> Any:
+    """Run ``ctx.state.kv.<op>(*args)`` from sync code. ``ctx.state`` degrades
+    open on its own (breaker, miss on read, drop on write), so only bridge
+    failures are handled here. On the loop thread itself blocking would
+    deadlock, so the call is scheduled and its result not awaited — only the
+    ``start()`` mirror write takes that path."""
+    if not _sharing_enabled() or _ctx is None or _loop is None:
         return None
-    with _client_lock:
-        if _client is not None:
-            return _client
-        if time.time() < _breaker_until:
-            return None
+    try:
+        coro = coro_fn(*args)
         try:
-            import redis  # sync client
-            _client = redis.Redis.from_url(
-                _redis_url(), decode_responses=True,
-                socket_connect_timeout=1, socket_timeout=1)
-            return _client
-        except Exception as exc:                          # noqa: BLE001
-            _breaker_until = time.time() + _BREAKER_COOLDOWN_S
-            log.debug("architecture: no shared job registry (%s) — job ids will "
-                      "only be visible on the worker that created them", exc)
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is _loop:
+            _loop.create_task(coro)
             return None
-
-
-def _trip(exc: Exception, what: str) -> None:
-    """Drop the client and stop trying for `_BREAKER_COOLDOWN_S`."""
-    global _client, _breaker_until
-    with _client_lock:
-        _client = None
-        _breaker_until = time.time() + _BREAKER_COOLDOWN_S
-    log.debug("architecture: shared job registry %s failed — falling back to "
-              "this worker's own jobs for %ss: %s", what, _BREAKER_COOLDOWN_S, exc)
+        return asyncio.run_coroutine_threadsafe(coro, _loop).result(_BRIDGE_TIMEOUT_S)
+    except Exception as exc:                              # noqa: BLE001
+        log.debug("architecture: shared job registry call failed — falling "
+                  "back to this worker's own jobs: %s", exc)
+        return None
 
 
 def _mirror(job: dict[str, Any], ttl: int) -> None:
     """Publish `job` for every other worker to read. Best-effort by design."""
-    client = _store()
-    if client is None:
+    if _ctx is None:
         return
-    try:
-        client.set(_key_prefix() + job["id"], json.dumps(job, default=str), ex=ttl)
-    except Exception as exc:                              # noqa: BLE001
-        _trip(exc, "write")
+    value = json.loads(json.dumps(job, default=str))
+    _call(lambda: _ctx.state.kv.put(job["id"], value, ttl))
 
 
 def _read_shared(job_id: str) -> dict[str, Any] | None:
-    client = _store()
-    if client is None:
+    if _ctx is None:
         return None
-    try:
-        raw = client.get(_key_prefix() + job_id)
-    except Exception as exc:                              # noqa: BLE001
-        _trip(exc, "read")
-        return None
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except ValueError:
-        log.debug("architecture: malformed shared job entry for %s", job_id)
-        return None
+    value = _call(lambda: _ctx.state.kv.get(job_id))
+    return value if isinstance(value, dict) else None
 
 
 def _scan_shared() -> list[dict[str, Any]]:
-    client = _store()
-    if client is None:
+    if _ctx is None:
         return []
-    prefix = _key_prefix()
+    names = _call(lambda: _ctx.state.kv.scan("run-")) or []
     found: list[dict[str, Any]] = []
-    try:
-        for key in client.scan_iter(match=f"{prefix}*"):
-            raw = client.get(key)
-            if not raw:
-                continue          # expired between the scan and the read
-            try:
-                found.append(json.loads(raw))
-            except ValueError:
-                continue
-    except Exception as exc:                              # noqa: BLE001
-        _trip(exc, "scan")
+    for name in names:
+        job = _read_shared(name)
+        if job is not None:   # None: expired between the scan and the read
+            found.append(job)
     return found
 
 

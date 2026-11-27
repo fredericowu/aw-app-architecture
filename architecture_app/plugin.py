@@ -27,6 +27,7 @@ import logging
 import os
 
 from . import routes as routes_mod
+from . import jobs
 from . import self_register
 from . import store
 
@@ -36,6 +37,7 @@ log = logging.getLogger("aw_apps.architecture")
 class ArchitectureAppPlugin:
     async def activate(self, ctx) -> None:
         store.bind(ctx)
+        jobs.bind(ctx)   # ctx.state.kv mirror for the cross-worker job registry
 
         try:
             store.ensure_schema()
